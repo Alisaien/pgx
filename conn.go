@@ -1325,6 +1325,151 @@ func (c *Conn) LoadType(ctx context.Context, typeName string) (*pgtype.Type, err
 	}
 }
 
+func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Type, error) {
+	var b Batch
+
+	type typeResolver struct {
+		oid         uint32
+		typname     string
+		typtype     string
+		typbasetype uint32
+		t           pgtype.Type
+	}
+
+	var types []*pgtype.Type
+	var elemBatch Batch
+	for _, name := range typeNames {
+		b.Queue("select oid, typtype::text, typbasetype from pg_type where oid=(select $1::regtype::oid)", name).QueryRow(func(r Row) error {
+			var (
+				t           pgtype.Type
+				typtype     string
+				typbasetype uint32
+			)
+			if err := r.Scan(&t.OID, &typtype, &typbasetype); err != nil {
+				return err
+			}
+
+			switch typtype {
+			case "b": // array
+				t.Name = name
+				t.Codec = &pgtype.ArrayCodec{}
+				c.TypeMap().RegisterType(&t)
+
+				elemBatch.Queue("select typelem from pg_type where oid=$1", t.OID).QueryRow(func(r Row) error {
+					var elemOID uint32
+					if err := r.Scan(&elemOID); err != nil {
+						return err
+					}
+
+					dt, ok := c.TypeMap().TypeForOID(elemOID)
+					if !ok {
+						return errors.New("array element OID not registered")
+					}
+
+					t.Codec.(*pgtype.ArrayCodec).ElementType = dt
+					return nil
+				})
+			case "c": // composite
+				t.Name = name
+				t.Codec = &pgtype.CompositeCodec{}
+				c.TypeMap().RegisterType(&t)
+
+				elemBatch.Queue(
+					"with rel as (select typrelid as id from pg_type where oid=$1)"+
+						"select attname, atttypid from pg_attribute"+
+						"where attrelid=rel.id and not attisdropped and attnum > 0"+
+						"order by attnum",
+					t.OID,
+				).Query(func(rows Rows) error {
+					var (
+						fields    []pgtype.CompositeCodecField
+						fieldName string
+						fieldOID  uint32
+					)
+
+					_, err := ForEachRow(rows, []any{&fieldName, &fieldOID}, func() error {
+						dt, ok := c.TypeMap().TypeForOID(fieldOID)
+						if !ok {
+							return fmt.Errorf("unknown composite type field OID: %v", fieldOID)
+						}
+						fields = append(fields, pgtype.CompositeCodecField{Name: fieldName, Type: dt})
+						return nil
+					})
+					if err != nil {
+						return err
+					}
+
+					t.Codec.(*pgtype.CompositeCodec).Fields = fields
+					return nil
+				})
+			case "d": // domain
+				dt, ok := c.TypeMap().TypeForOID(typbasetype)
+				if !ok {
+					return errors.New("domain base type OID not registered")
+				}
+
+				t.Name = name
+				t.Codec = dt.Codec
+				c.TypeMap().RegisterType(&t)
+			case "e": // enum
+				t.Name = name
+				t.Codec = &pgtype.EnumCodec{}
+				c.TypeMap().RegisterType(&t)
+			case "r": // range
+				t.Name = name
+				t.Codec = &pgtype.RangeCodec{}
+				c.TypeMap().RegisterType(&t)
+
+				elemBatch.Queue("select rngsubtype from pg_range where rngtypid=$1", t.OID).QueryRow(func(r Row) error {
+					var elemOID uint32
+					if err := r.Scan(&elemOID); err != nil {
+						return err
+					}
+
+					dt, ok := c.TypeMap().TypeForOID(elemOID)
+					if !ok {
+						return errors.New("range element OID not registered")
+					}
+
+					t.Codec.(*pgtype.RangeCodec).ElementType = dt
+					return nil
+				})
+			case "m": // multirange
+				t.Name = name
+				t.Codec = &pgtype.MultirangeCodec{}
+				c.TypeMap().RegisterType(&t)
+
+				elemBatch.Queue("select rngtypid from pg_range where rngmultitypid=$1", t.OID).QueryRow(func(r Row) error {
+					var elemOID uint32
+					if err := r.Scan(&elemOID); err != nil {
+						return err
+					}
+
+					dt, ok := c.TypeMap().TypeForOID(elemOID)
+					if !ok {
+						return errors.New("multirange element OID not registered")
+					}
+
+					t.Codec.(*pgtype.MultirangeCodec).ElementType = dt
+					return nil
+				})
+			}
+
+			return nil
+		})
+	}
+
+	if r := c.SendBatch(ctx, &b); r.Close() != nil {
+		return nil, r.Close()
+	}
+
+	if r := c.SendBatch(ctx, &elemBatch); r.Close() != nil {
+		return nil, r.Close()
+	}
+
+	return types, nil
+}
+
 func (c *Conn) getArrayElementOID(ctx context.Context, oid uint32) (uint32, error) {
 	var typelem uint32
 
