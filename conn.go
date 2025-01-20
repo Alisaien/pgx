@@ -1328,13 +1328,6 @@ func (c *Conn) LoadType(ctx context.Context, typeName string) (*pgtype.Type, err
 func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Type, error) {
 	var b Batch
 
-	type typeResolver struct {
-		oid     uint32
-		typname string
-		typtype string
-		t       pgtype.Type
-	}
-
 	var types []*pgtype.Type
 	var elemBatch Batch
 	for _, name := range typeNames {
