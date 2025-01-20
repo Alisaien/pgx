@@ -1329,23 +1329,23 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 	var b Batch
 
 	type typeResolver struct {
-		oid         uint32
-		typname     string
-		typtype     string
-		typbasetype uint32
-		t           pgtype.Type
+		oid     uint32
+		typname string
+		typtype string
+		t       pgtype.Type
 	}
 
 	var types []*pgtype.Type
 	var elemBatch Batch
 	for _, name := range typeNames {
-		b.Queue("select oid, typtype::text, typbasetype from pg_type where oid=(select $1::regtype::oid)", name).QueryRow(func(r Row) error {
+		b.Queue("select oid, typtype::text from pg_type where oid=$1::regtype::oid", name).QueryRow(func(r Row) error {
 			var (
 				t           pgtype.Type
 				typtype     string
 				typbasetype uint32
 			)
-			if err := r.Scan(&t.OID, &typtype, &typbasetype); err != nil {
+
+			if err := r.Scan(&t.OID, &typtype); err != nil {
 				return err
 			}
 
@@ -1376,9 +1376,9 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 
 				elemBatch.Queue(
 					"with rel as (select typrelid as id from pg_type where oid=$1)"+
-						"select attname, atttypid from pg_attribute"+
-						"where attrelid=rel.id and not attisdropped and attnum > 0"+
-						"order by attnum",
+						" select attname, atttypid from pg_attribute, rel"+
+						" where attrelid=rel.id and not attisdropped and attnum > 0"+
+						" order by attnum",
 					t.OID,
 				).Query(func(rows Rows) error {
 					var (
@@ -1403,14 +1403,23 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 					return nil
 				})
 			case "d": // domain
-				dt, ok := c.TypeMap().TypeForOID(typbasetype)
-				if !ok {
-					return errors.New("domain base type OID not registered")
-				}
-
 				t.Name = name
-				t.Codec = dt.Codec
 				c.TypeMap().RegisterType(&t)
+
+				elemBatch.Queue("select typbasetype from pg_type where oid=$1", t.OID).QueryRow(func(row Row) error {
+					var baseTypeOID uint32
+					if err := r.Scan(&baseTypeOID); err != nil {
+						return err
+					}
+
+					dt, ok := c.TypeMap().TypeForOID(typbasetype)
+					if !ok {
+						return errors.New("domain base type OID not registered")
+					}
+
+					t.Codec = dt.Codec
+					return nil
+				})
 			case "e": // enum
 				t.Name = name
 				t.Codec = &pgtype.EnumCodec{}
